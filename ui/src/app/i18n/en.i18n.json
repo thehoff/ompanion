@@ -1336,6 +1336,20 @@
     "skippedBinary": "binary",
     "backgroundResult": "Background result",
     "delegated": "Delegated request",
+    "advisor": "Advisor",
+    "advisorNotes": {
+      "one": "$n note",
+      "other": "$n notes"
+    },
+    "advisorBlockers": {
+      "one": "$n blocker",
+      "other": "$n blockers"
+    },
+    "advisorNote": "Note",
+    "advisorNit": "Nit",
+    "advisorConcern": "Concern",
+    "advisorBlocker": "Blocker",
+    "advisorTurnsAgo": "T-$n",
     "turn": {
       "workedFor": "Worked for $duration",
       "worked": "Worked",
