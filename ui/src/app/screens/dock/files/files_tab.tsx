@@ -4,15 +4,18 @@ import { call } from "../../../../bridge";
 import { hostPath } from "../../../../core/host/scripts";
 import type { LiveSession } from "../../../../core/session/live_session";
 import { HostFileExists } from "../../../../core/transport/host_link";
-import { useDock, useSessions } from "../../../app_state";
-import { baseName, breadcrumbs, checkName, extensionOf, isRootPath, type NameProblem, parentPath } from "../../../files/file_paths";
+import { useDock, useSessions, useSettings } from "../../../app_state";
+import type { FileDocument } from "../../../files/file_document";
+import { baseName, checkName, extensionOf, isRootPath, type NameProblem, parentPath } from "../../../files/file_paths";
 import type { BrowserRow, EntryRow, FileWorkspace } from "../../../files/file_workspace";
 import { type GitChange, gitStatusChangeOf } from "../../../files/git_status";
 import { t } from "../../../i18n/i18n";
 import type { Machine } from "../../../models/machine";
 import { isTouch } from "../../../platform";
+import { Prefs } from "../../../providers/settings_provider";
 import { formatBytes } from "../../../utils/byte_size";
 import { ActivityMark } from "../../../widgets/activity_mark";
+import { AppSearchField } from "../../../widgets/app_search_field";
 import { FilledButton, IconButton, TextButton } from "../../../widgets/button";
 import { Dialog, showDialog } from "../../../widgets/dialog";
 import { Icon } from "../../../widgets/icon";
@@ -23,7 +26,11 @@ import { showSnackBar } from "../../../widgets/snackbar";
 import * as Symbols from "../../../widgets/symbols";
 import { TextField } from "../../../widgets/text_field";
 import { tooltip } from "../../../widgets/tooltip";
+import { DockEmptyState } from "../dock_empty_state";
 import { machineAccess } from "../machine_access";
+import { confirmDiscardIfDirty } from "./discard_edits";
+import { fileBrowserNoMatches, filterBrowserRows } from "./file_browser_filter";
+import { FileCrumbs } from "./file_crumbs_view";
 import "./files_tab.css";
 
 // CodeMirror comes with the editor, when a document opens.
@@ -36,7 +43,9 @@ const FileEditorView = lazy(() => import("./file_editor_view"), { export: "FileE
 export function FilesTab(props: { readonly machine: Machine; readonly session: LiveSession | undefined }) {
   const dock = useDock();
   const sessions = useSessions();
+  const settings = useSettings();
   const workspace = createMemo(() => dock.files(props.machine.id));
+  const tabsMode = () => settings.get(Prefs.openFilesAsTabs);
 
   const open = async (path: string, line?: number) => {
     try {
@@ -67,23 +76,79 @@ export function FilesTab(props: { readonly machine: Machine; readonly session: L
   );
 
   return (
-    <Show
-      when={workspace().current()}
-      keyed
-      fallback={<Browser workspace={workspace()} onOpen={(path) => void open(path)} />}
-    >
-      {(document) => (
-        <Loading
-          fallback={
-            <div class="files-tab-center">
-              <ActivityMark size={20} />
-            </div>
-          }
+    <div class="files-tab-frame">
+      <Show when={tabsMode() && workspace().documents().length > 0}>
+        <OpenFileTabs workspace={workspace()} />
+      </Show>
+      <div class="files-tab-stage">
+        <Show
+          when={workspace().current()}
+          keyed
+          fallback={<Browser workspace={workspace()} hideOpenFiles={tabsMode()} onOpen={(path) => void open(path)} />}
         >
-          <FileEditorView workspace={workspace()} document={document} />
-        </Loading>
-      )}
-    </Show>
+          {(document) => (
+            <Loading
+              fallback={
+                <div class="files-tab-center">
+                  <ActivityMark size={20} />
+                </div>
+              }
+            >
+              <FileEditorView workspace={workspace()} document={document} documentPills={!tabsMode()} />
+            </Loading>
+          )}
+        </Show>
+      </div>
+    </div>
+  );
+}
+
+/** Open documents as a tab strip, shown instead of the open-files control when that setting is on. */
+function OpenFileTabs(props: { readonly workspace: FileWorkspace }) {
+  const close = async (document: FileDocument) => {
+    if (!(await confirmDiscardIfDirty(document))) return;
+    props.workspace.closeDocument(document);
+  };
+  return (
+    <div class="files-tab-open-tabs" role="tablist">
+      <For each={props.workspace.documents()}>
+        {(document) => {
+          const selected = () => document === props.workspace.current();
+          return (
+            <div
+              class={["files-tab-open-tab", { "files-tab-open-tab-selected": selected() }]}
+              data-ripple
+              role="tab"
+              aria-selected={selected() ? "true" : "false"}
+              tabindex="0"
+              ref={tooltip(() => hostPath(document.path()))}
+              onClick={() => props.workspace.show(document)}
+              onKeyDown={(event) => {
+                if (event.target !== event.currentTarget || (event.key !== "Enter" && event.key !== " ")) return;
+                event.preventDefault();
+                props.workspace.show(document);
+              }}
+            >
+              <span class="files-tab-open-tab-name">{baseName(document.path())}</span>
+              <Show when={document.dirty()}>
+                <span class="files-tab-open-tab-dirty" />
+              </Show>
+              <IconButton
+                icon={Symbols.close}
+                iconSize={16}
+                size={28}
+                class="files-tab-open-tab-close"
+                tooltip={t.common.close}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  void close(document);
+                }}
+              />
+            </div>
+          );
+        }}
+      </For>
+    </div>
   );
 }
 
@@ -92,8 +157,14 @@ type EntryAction = "open" | "newFile" | "newFolder" | "rename" | "copyPath" | "d
 /** Rows drawn beyond the visible ones on each side, so a fast scroll does not show empty space. */
 const overscanRows = 10;
 
-function Browser(props: { readonly workspace: FileWorkspace; readonly onOpen: (path: string) => void }) {
+function Browser(props: {
+  readonly workspace: FileWorkspace;
+  readonly hideOpenFiles: boolean;
+  readonly onOpen: (path: string) => void;
+}) {
   const strings = () => t.dock.fileBrowser;
+  const [query, setQuery] = createSignal("");
+  const [filterEpoch, setFilterEpoch] = createSignal(1);
   const failed = (error: unknown) => showSnackBar(strings().failed({ error: String(error) }));
 
   const create = async (dir: string, folder: boolean) => {
@@ -193,7 +264,7 @@ function Browser(props: { readonly workspace: FileWorkspace; readonly onOpen: (p
     >
       {(root) => (
         <div class="files-tab">
-          <Breadcrumbs
+          <FileCrumbs
             path={root()}
             home={props.workspace.homeDir()}
             onOpen={(dir) => void props.workspace.openDir(dir)}
@@ -225,7 +296,7 @@ function Browser(props: { readonly workspace: FileWorkspace; readonly onOpen: (p
               onClick={() => void create(root(), true)}
             />
             <span class="files-tab-spacer" />
-            <Show when={props.workspace.documents().length > 0}>
+            <Show when={!props.hideOpenFiles && props.workspace.documents().length > 0}>
               <TextButton
                 icon={Symbols.description}
                 onClick={() => {
@@ -238,8 +309,27 @@ function Browser(props: { readonly workspace: FileWorkspace; readonly onOpen: (p
               </TextButton>
             </Show>
           </div>
+          <For each={[{ epoch: filterEpoch() }]} keyed={(item) => item.epoch}>
+            {(item) => (
+              <AppSearchField
+                class="files-tab-filter"
+                hint={strings().filterHint}
+                autofocus={item().epoch > 1}
+                onChanged={setQuery}
+                onKeyDown={(event) => {
+                  if (event.key !== "Escape") return;
+                  const field = event.target;
+                  if (!(field instanceof HTMLInputElement) || field.value === "") return;
+                  event.preventDefault();
+                  setQuery("");
+                  setFilterEpoch((n) => n + 1);
+                }}
+              />
+            )}
+          </For>
           <BrowserList
             workspace={props.workspace}
+            query={query()}
             onOpen={props.onOpen}
             onMenu={(entry, point) => void menu(entry, point)}
           />
@@ -252,13 +342,22 @@ function Browser(props: { readonly workspace: FileWorkspace; readonly onOpen: (p
 /** The rows in view and no more: every row is one height, as ListView's itemExtent. */
 function BrowserList(props: {
   readonly workspace: FileWorkspace;
+  readonly query: string;
   readonly onOpen: (path: string) => void;
   readonly onMenu: (row: EntryRow, point: { x: number; y: number }) => void;
 }) {
+  const settings = useSettings();
   const [scrollTop, setScrollTop] = createSignal(0);
   const [viewHeight, setViewHeight] = createSignal(0);
   const rowHeight = () => (isTouch() ? 44 : 32);
-  const rows = createMemo(() => props.workspace.rows());
+  const rows = createMemo(() =>
+    filterBrowserRows(props.workspace.rows(), {
+      hideDotFolders: settings.get(Prefs.hideDotFolders),
+      hideDotFiles: settings.get(Prefs.hideDotFiles),
+      query: props.query,
+    }),
+  );
+  const noMatches = () => fileBrowserNoMatches(rows());
   const visible = createMemo(() => {
     const height = rowHeight();
     const first = Math.max(0, Math.floor(scrollTop() / height) - overscanRows);
@@ -273,13 +372,18 @@ function BrowserList(props: {
   });
   return (
     <div class="files-tab-list" ref={list} onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}>
-      <div class="files-tab-extent" style={{ height: `${rows().length * rowHeight()}px` }}>
-        <div class="files-tab-window" style={{ transform: `translateY(${visible().first * rowHeight()}px)` }}>
-          <For each={visible().rows} keyed={rowKey}>
-            {(row) => <BrowserLine row={row()} workspace={props.workspace} onOpen={props.onOpen} onMenu={props.onMenu} />}
-          </For>
+      <Show
+        when={!noMatches()}
+        fallback={<DockEmptyState icon={Symbols.filter_list_off} message={t.dock.fileBrowser.filterEmpty} />}
+      >
+        <div class="files-tab-extent" style={{ height: `${rows().length * rowHeight()}px` }}>
+          <div class="files-tab-window" style={{ transform: `translateY(${visible().first * rowHeight()}px)` }}>
+            <For each={visible().rows} keyed={rowKey}>
+              {(row) => <BrowserLine row={row()} workspace={props.workspace} onOpen={props.onOpen} onMenu={props.onMenu} />}
+            </For>
+          </div>
         </div>
-      </div>
+      </Show>
     </div>
   );
 }
@@ -469,40 +573,6 @@ function fileIcon(name: string): string {
     default:
       return Symbols.draft;
   }
-}
-
-/** The directories from `/`, or from `~` inside the home, down to `path`, the deepest one in view at the end. */
-function Breadcrumbs(props: {
-  readonly path: string;
-  readonly home: string | undefined;
-  readonly onOpen: (dir: string) => void;
-}) {
-  let strip!: HTMLDivElement;
-  const crumbs = createMemo(() => breadcrumbs(props.path, props.home));
-  createEffect(crumbs, () => {
-    strip.scrollLeft = strip.scrollWidth;
-  });
-  return (
-    <div class="files-tab-crumbs" ref={strip}>
-      <For each={crumbs()}>
-        {(crumb, index) => (
-          <>
-            <Show when={index() > 0}>
-              <Icon icon={Symbols.chevron_right} size={16} class="files-tab-crumb-separator" />
-            </Show>
-            <Show
-              when={index() < crumbs().length - 1}
-              fallback={<span class="files-tab-crumb files-tab-crumb-last">{crumb.label}</span>}
-            >
-              <button type="button" data-ripple class="files-tab-crumb" onClick={() => props.onOpen(crumb.path)}>
-                {crumb.label}
-              </button>
-            </Show>
-          </>
-        )}
-      </For>
-    </div>
-  );
 }
 
 /** Asks for a new name; undefined when cancelled. With `initial`, its stem is selected, as file managers do. */
